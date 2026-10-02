@@ -357,6 +357,7 @@ pub(super) async fn start_kernel_impl(
             enable_kernel_guard(
                 app_handle.clone(),
                 resolved.api_port,
+                resolved.proxy.proxy_port,
                 resolved.proxy.tun_enabled,
             )
             .await;
@@ -502,6 +503,7 @@ pub(super) async fn start_kernel_impl(
                         enable_kernel_guard(
                             app_handle.clone(),
                             resolved.api_port,
+                            resolved.proxy.proxy_port,
                             resolved.proxy.tun_enabled,
                         )
                         .await;
@@ -531,6 +533,7 @@ pub(super) async fn start_kernel_impl(
                         enable_kernel_guard(
                             app_handle.clone(),
                             resolved.api_port,
+                            resolved.proxy.proxy_port,
                             resolved.proxy.tun_enabled,
                         )
                         .await;

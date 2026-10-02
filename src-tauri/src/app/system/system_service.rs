@@ -420,6 +420,57 @@ pub async fn check_network_connectivity(strict: Option<bool>) -> Result<bool, St
     perform_network_probe(strict.unwrap_or(false)).await
 }
 
+/// 通过内核 mixed 入站端口（本地 HTTP 代理）探测外网连通性。
+///
+/// 与 [`perform_network_probe`] 的直连探测不同：这里请求会经过内核分流，
+/// 非 CN 探测目标会被路由到代理出站。因此能发现"内核进程存活、端口可 accept，
+/// 但代理隧道（如 hysteria2 QUIC 连接）已静默死亡"的假活状态——这种状态下
+/// 直连探测永远成功，而代理探测会超时。
+///
+/// 任一探测 URL 成功（2xx/204）即视为代理链路健康。
+pub async fn perform_proxy_probe(proxy_port: u16) -> bool {
+    perform_proxy_probe_with_timeout(proxy_port, Duration::from_secs(4)).await
+}
+
+async fn perform_proxy_probe_with_timeout(proxy_port: u16, per_request_timeout: Duration) -> bool {
+    let proxy_url = format!("http://127.0.0.1:{}", proxy_port);
+    let proxy = match reqwest::Proxy::all(&proxy_url) {
+        Ok(proxy) => proxy,
+        Err(err) => {
+            debug!("构造代理探测客户端失败: {}", err);
+            return false;
+        }
+    };
+
+    let client = match Client::builder()
+        .timeout(per_request_timeout)
+        .proxy(proxy)
+        .user_agent("sing-box-windows/connectivity-check")
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            debug!("构建代理探测客户端失败: {}", err);
+            return false;
+        }
+    };
+
+    for url in HTTP_PROBE_URLS.iter() {
+        match client.get(*url).send().await {
+            Ok(response) => {
+                if response.status().is_success() || response.status().as_u16() == 204 {
+                    debug!("代理链路检测成功: {}", url);
+                    return true;
+                }
+                debug!("代理链路检测失败: {} -> 状态 {}", url, response.status().as_u16());
+            }
+            Err(err) => debug!("代理链路检测异常: {} -> {}", url, err),
+        }
+    }
+
+    false
+}
+
 #[tauri::command]
 pub async fn wait_for_network_ready(
     timeout_ms: Option<u64>,
@@ -462,5 +513,54 @@ pub async fn wait_for_network_ready(
             .checked_sub(start.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
         sleep(std::cmp::min(interval, remaining)).await;
+    }
+}
+
+#[cfg(test)]
+mod proxy_probe_tests {
+    use super::perform_proxy_probe_with_timeout;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    /// 端口无监听（内核进程已死）时应快速返回 false。
+    #[tokio::test]
+    async fn probe_fails_when_nothing_listens() {
+        // 先绑定再释放，拿到一个几乎必然无监听的端口。
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let started = std::time::Instant::now();
+        assert!(!perform_proxy_probe_with_timeout(port, Duration::from_millis(300)).await);
+        // 无监听时应因连接拒绝快速失败，而不是等满全部探测 URL 的超时。
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// 端口可 accept 但隧道黑洞（进程假活、QUIC 隧道已死）时必须返回 false。
+    /// 这是守护自愈依赖的核心语义：直连探测在此场景下会成功，只有代理探测能发现。
+    #[tokio::test]
+    async fn probe_fails_on_silent_tunnel() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // 假代理：accept 后读走请求但永不响应，模拟 mixed 入站存活、出站隧道黑洞。
+        let sink = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                let (mut conn, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let _ = conn.read(&mut buf).await;
+            }
+        });
+
+        let started = std::time::Instant::now();
+        assert!(!perform_proxy_probe_with_timeout(port, Duration::from_millis(200)).await);
+        // 3 个探测 URL 各 200ms 超时，总耗时应显著低于单 URL 超时的 10 倍量级。
+        assert!(started.elapsed() < Duration::from_secs(4));
+
+        sink.abort();
     }
 }
